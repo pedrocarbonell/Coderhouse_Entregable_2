@@ -1,5 +1,4 @@
-pydantic
-langchain-core
-python-dotenv
 openai
-langchain-openai
+anthropic
+pydantic
+python-dotenv

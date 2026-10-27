@@ -1,55 +1,152 @@
 import asyncio
-import os
-import langchain_core
+from collections.abc import AsyncIterator
+
+import anthropic
 import openai
-import pydantic
-from pydantic import BaseModel, ValidationError, SecretStr
-from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from dotenv import load_dotenv
-from schemas import EntityExtraction
+from pydantic import ValidationError
 
-load_dotenv()
+from schemas import ChatMessage, LLMConfig, ModelResponse
 
-async def process_text(text:str):
-    llm = ChatOpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        model="gpt-6-luna",
-        reasoning_effort="medium",
-    )
+RETRYABLE = (
+    openai.APIConnectionError,
+    openai.RateLimitError,
+    anthropic.APIConnectionError,
+    anthropic.RateLimitError,
+)
 
-    structured_llm = llm.with_structured_output(EntityExtraction)
 
-    resilient_llm = structured_llm.with_retry(
-        wait_exponential_jitter=True,
-        stop_after_attempt=3,
-        retry_if_exception_type=(openai.APIConnectionError,
-                                 openai.RateLimitError,
-                                 pydantic.ValidationError,
-                                 langchain_core.exceptions.OutputParserException))
+class AsyncLLMManager:
+    def __init__(self, config: LLMConfig):
+        self.config = config
+        self._delay = 0.5
+        if config.provider == "openai":
+            assert config.openai_api_key is not None
+            self._client = openai.AsyncOpenAI(
+                api_key=config.openai_api_key.get_secret_value(), max_retries=0
+            )
+        else:
+            assert config.anthropic_api_key is not None
+            self._client = anthropic.AsyncAnthropic(
+                api_key=config.anthropic_api_key.get_secret_value(), max_retries=0
+            )
 
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system",
-             "Eres un arquitecto de software y recibes un parrafo que describe una arquitectura de software o "
-             "log de error y devuelve un objeto validado"),
-            ("human", "Parrafo: {parrafo}"),
-        ]
+    def _messages(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        if not messages:
+            raise ValueError("se requiere al menos un mensaje")
+        return [ChatMessage.model_validate(m) for m in messages]
 
-    )
+    def _openai(self, messages: list[ChatMessage]) -> dict:
+        return {
+            "model": self.config.openai_model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
 
+    def _anthropic(self, messages: list[ChatMessage]) -> dict:
+        system = "\n".join(m.content for m in messages if m.role == "system")
+        chat = [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
+        if not chat:
+            chat = [{"role": "user", "content": system}]
+            system = ""
+        # ponytail: este SDK no acepta temperature; el rango vive en LLMConfig y solo se envía a OpenAI
+        kwargs = {
+            "model": self.config.anthropic_model,
+            "messages": chat,
+            "max_tokens": self.config.max_tokens,
+        }
+        if system:
+            kwargs["system"] = system
+        return kwargs
+
+    async def _complete(self, messages: list[ChatMessage]) -> str:
+        if self.config.provider == "openai":
+            resp = await self._client.chat.completions.create(**self._openai(messages))
+            return resp.choices[0].message.content or ""
+        resp = await self._client.messages.create(**self._anthropic(messages))
+        return "".join(block.text for block in resp.content if getattr(block, "text", None))
+
+    async def _tokens(self, messages: list[ChatMessage]) -> AsyncIterator[str]:
+        if self.config.provider == "openai":
+            stream = await self._client.chat.completions.create(**self._openai(messages), stream=True)
+            async for chunk in stream:
+                if chunk.choices and (delta := chunk.choices[0].delta.content):
+                    yield delta
+            return
+        async with self._client.messages.stream(**self._anthropic(messages)) as stream:
+            async for text in stream.text_stream:
+                yield text
+
+    async def generate(self, messages: list[ChatMessage]) -> ModelResponse:
+        try:
+            messages = self._messages(messages)
+        except (ValidationError, ValueError) as e:
+            return ModelResponse(provider=self.config.provider, error=str(e))
+        last = "error desconocido"
+        for attempt in range(3):
+            try:
+                text = await self._complete(messages)
+                return ModelResponse(content=text, provider=self.config.provider)
+            except RETRYABLE as e:
+                last = f"{type(e).__name__}: {e}"
+                if attempt < 2:
+                    await asyncio.sleep(self._delay * 2**attempt)
+            except (openai.APIError, anthropic.APIError) as e:
+                return ModelResponse(provider=self.config.provider, error=f"{type(e).__name__}: {e}")
+        return ModelResponse(provider=self.config.provider, error=last)
+
+    async def stream(self, messages: list[ChatMessage]) -> AsyncIterator[str]:
+        try:
+            messages = self._messages(messages)
+        except (ValidationError, ValueError) as e:
+            yield f"\n[error] {e}\n"
+            return
+        last = "error desconocido"
+        for attempt in range(3):
+            try:
+                async for token in self._tokens(messages):
+                    yield token
+                return
+            except RETRYABLE as e:
+                last = f"{type(e).__name__}: {e}"
+                if attempt < 2:
+                    await asyncio.sleep(self._delay * 2**attempt)
+            except (openai.APIError, anthropic.APIError) as e:
+                yield f"\n[error] {type(e).__name__}: {e}\n"
+                return
+        yield f"\n[error] {last}\n"
+
+
+def _self_check() -> None:
     try:
-        chain = prompt | resilient_llm
-        response = await chain.ainvoke({"parrafo": text})
-        return response
-    except ValidationError as e:
-        print(f"La respuesta del LLM no cumple el esquema: {e.error_count()} errores")
-        for err in e.errors():
-            print(f" - {err['loc'][0]}: {err['msg']} (recibido: {err['input']!r})")
-    except Exception as e:
-        print(f"Error: {e}")
+        LLMConfig(temperature=3, openai_api_key="k")
+        raise SystemExit("temperature fuera de rango pasó")
+    except ValidationError:
+        pass
+
+    calls = 0
+
+    async def flaky(messages: list[ChatMessage]) -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            import httpx2
+
+            req = httpx2.Request("POST", "https://api.openai.com/v1/chat/completions")
+            raise openai.RateLimitError("slow", response=httpx2.Response(429, request=req), body=None)
+        return "ok"
+
+    manager = AsyncLLMManager(LLMConfig(provider="openai", openai_api_key="k", temperature=0, max_tokens=8))
+    manager._delay = 0
+    manager._complete = flaky
+
+    async def run() -> None:
+        out = await manager.generate([ChatMessage(role="user", content="hola")])
+        assert out.content == "ok" and out.error is None and calls == 3, out
+
+    asyncio.run(run())
 
 
-
-
-
+if __name__ == "__main__":
+    _self_check()
+    print("ok")
